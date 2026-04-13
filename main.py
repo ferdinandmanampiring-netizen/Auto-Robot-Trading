@@ -1,311 +1,169 @@
-# === SNIPER POWERFUL FERDY v4.5 (VERBOSE SCORING + CONTROLLED SCAN) ===
-
-# ==========================================================
-# 🔥 IMPORT
-# ==========================================================
-import time as t  # 🔥 Anti bentrok dengan datetime.time
 import MetaTrader5 as mt5
-import os
-import json
+import time as t
 from datetime import datetime
+import pandas as pd
 
-from engines.liquidity_engine import analyze_liquidity
-from engines.zone_engine import analyze_zone
-from engines.context_engine import build_context
-from core.risk_engine import RiskEngine
-from core.execution_engine import execute_trade_hybrid, ensure_connection
 from core.logging_engine import log
-from utils.helpers import get_market_data
-from robot_config import *
+from core.risk_engine import RiskEngine
+import core.execution_engine as exec_engine
+import engines.context_engine as ctx
+
+
+TRADE_SCORE_THRESHOLD = 20
 
 
 # ==========================================================
-# 🔰 COOLDOWN STORAGE (PERSISTENT)
+# 📊 DATA
 # ==========================================================
-COOLDOWN_FILE = "cooldown_state.json"
-
-
-def load_cooldown_state(symbols):
-    """
-    🔥 TUJUAN:
-    Menyimpan cooldown walaupun bot restart
-    """
-    if os.path.exists(COOLDOWN_FILE):
-        try:
-            with open(COOLDOWN_FILE, "r") as f:
-                data = json.load(f)
-                return {s: data.get(s, 0) for s in symbols}
-        except Exception as e:
-            log(f"⚠️ COOLDOWN LOAD ERROR: {e}")
-    return {s: 0 for s in symbols}
-
-
-def save_cooldown_state(state):
-    """
-    🔥 TUJUAN:
-    Anti file corrupt dengan atomic write
-    """
-    temp_file = COOLDOWN_FILE + ".tmp"
-    with open(temp_file, "w") as f:
-        json.dump(state, f)
-    os.replace(temp_file, COOLDOWN_FILE)
-
-
-# ==========================================================
-# 🔥 ACTIVE SYMBOL CONTROLLER (TRIAL MODE SYNC)
-# ==========================================================
-def get_active_symbols():
-    """
-    ==========================================================
-    🔥 TUJUAN:
-    - Sinkronisasi TRIAL_MODE dengan symbol loop
-    - Jika trial aktif → hanya 1 symbol
-    - Jika tidak → semua symbol aktif
-    ==========================================================
-    """
-
-    if TRIAL_MODE:
-        log(f"🎯 TRIAL MODE AKTIF → HANYA {TRIAL_SYMBOL}")
-        return [TRIAL_SYMBOL]
-
-    return SYMBOLS
-
-
-# ==========================================================
-# 🔥 UNIVERSAL LOT HANDLER
-# ==========================================================
-def get_lot_size(risk_engine, entry, sl):
-
-    if hasattr(risk_engine, "calculate_lot"):
-        return risk_engine.calculate_lot(entry, sl)
-
-    elif hasattr(risk_engine, "calculate_position_size"):
-        return risk_engine.calculate_position_size(entry, sl)
-
-    elif hasattr(risk_engine, "get_lot_size"):
-        return risk_engine.get_lot_size(entry, sl)
-
-    else:
-        log("❌ LOT FUNCTION NOT FOUND")
+def get_data(symbol, timeframe, bars=300):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, bars)
+    if rates is None:
         return None
 
-
-# ==========================================================
-# 🔥 STOP LEVEL PROTECTION (BROKER AWARE)
-# ==========================================================
-def adjust_to_stops_level(symbol, entry, target_sl, is_buy):
-
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        return target_sl
-
-    stops_level_points = symbol_info.trade_stops_level
-    min_dist = (stops_level_points + 50) * symbol_info.point
-
-    if abs(entry - target_sl) < min_dist:
-        new_sl = entry - min_dist if is_buy else entry + min_dist
-        log(f"⚠️ SL Adjusted for {symbol}")
-        return new_sl
-
-    return target_sl
+    df = pd.DataFrame(rates)
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    return df
 
 
 # ==========================================================
-# 🔰 MAIN ENGINE
+# 🔥 ATR
+# ==========================================================
+def calculate_atr(df, period=14):
+    df['tr'] = df['high'] - df['low']
+    return df['tr'].rolling(period).mean().iloc[-1]
+
+
+# ==========================================================
+# 🔥 SWING SL (MANDAT)
+# ==========================================================
+def get_swing_sl(df, is_buy, atr):
+    buffer = atr * 0.5
+
+    if is_buy:
+        swing_low = df['low'].tail(5).min()
+        return swing_low - buffer
+    else:
+        swing_high = df['high'].tail(5).max()
+        return swing_high + buffer
+
+
+# ==========================================================
+# 🔥 RR
+# ==========================================================
+def calculate_tp(entry, sl):
+    risk = abs(entry - sl)
+    return entry + (risk * 2) if entry < sl else entry - (risk * 2)
+
+
+# ==========================================================
+# 🚀 MAIN
 # ==========================================================
 def main():
 
-    log("🚀 SYSTEM START")
+    log("🚀 SNIPER ELIT MODE v6.0 FINAL")
 
-    if not ensure_connection():
-        log("❌ INITIAL CONNECTION FAILED")
+    if not mt5.initialize():
+        log("❌ MT5 Failed")
         return
 
-    symbols_to_trade = get_active_symbols()
-    last_trade_times = load_cooldown_state(symbols_to_trade)
-    last_manage_time = {}
+    risk_engine = RiskEngine()
+
+    symbols = [
+        "EURUSDc","GBPUSDc","USDJPYc","BTCUSDc",
+        "AUDUSDc","USDCHFc","NZDUSDc","EURGBPc","XAGUSDc"
+    ]
 
     while True:
         try:
 
-            # ==================================================
-            # 🔥 SAFE RECONNECT
-            # ==================================================
-            term = mt5.terminal_info()
-            if term is None or not term.connected:
-                if not ensure_connection():
-                    log("❌ RECONNECT FAILED")
-                    t.sleep(5)
+            # 🔥 EXIT MANAGEMENT (WAJIB SELALU JALAN)
+            risk_engine.manage_open_positions()
+
+            for symbol in symbols:
+
+                # =========================
+                # 🛡️ RISK FILTER
+                # =========================
+                allowed, reason = risk_engine.can_trade(symbol)
+
+                # =========================
+                # 📊 DATA
+                # =========================
+                htf = get_data(symbol, mt5.TIMEFRAME_H1)
+                ltf = get_data(symbol, mt5.TIMEFRAME_M5)
+
+                if htf is None or ltf is None:
+                    log(f"[SCAN] {symbol} | Score: 0/20 | Result: Data Error")
                     continue
 
-            # ==================================================
-            # 🔁 LOOP PER SYMBOL
-            # ==================================================
-            for SYMBOL in symbols_to_trade:
+                context = ctx.build_context(htf, ltf)
 
-                symbol_info = mt5.symbol_info(SYMBOL)
-                if symbol_info is None:
+                if not context.get("valid"):
+                    log(f"[SCAN] {symbol} | Score: 0/20 | Result: Context Invalid")
                     continue
 
-                risk_engine = RiskEngine(symbol=SYMBOL)
+                score = context["context_score"]
+                pd_zone = context.get("pd_zone")
+                trend = context.get("htf_trend")
 
-                # ==================================================
-                # 🔥 EXIT MANAGEMENT (TETAP DI ENGINE)
-                # ==================================================
-                if EXECUTE_TRADES:
-                    positions = mt5.positions_get(symbol=SYMBOL)
-
-                    if positions:
-                        now = t.time()
-
-                        if now - last_manage_time.get(SYMBOL, 0) > 30:
-
-                            if hasattr(risk_engine, "manage_open_positions"):
-                                risk_engine.manage_open_positions()
-
-                            elif hasattr(risk_engine, "apply_tp1_tp2_logic"):
-                                risk_engine.apply_tp1_tp2_logic()
-
-                            last_manage_time[SYMBOL] = now
-
-                # ==================================================
-                # 🔰 ENTRY GATE
-                # ==================================================
-                can_trade, reason = risk_engine.can_trade()
-                if not can_trade:
+                # =========================
+                # 🔥 PD FILTER
+                # =========================
+                if trend == "BULLISH" and pd_zone != "DISCOUNT":
+                    log(f"[SCAN] {symbol} | Score: {score}/20 | Result: Not Discount")
                     continue
 
-                # ==================================================
-                # 🔰 MARKET DATA
-                # ==================================================
-                data_ltf = get_market_data(SYMBOL, TIMEFRAME_LTF, 100)
-                data_htf = get_market_data(SYMBOL, TIMEFRAME_HTF, 100)
-
-                if data_ltf is None or data_htf is None:
+                if trend == "BEARISH" and pd_zone != "PREMIUM":
+                    log(f"[SCAN] {symbol} | Score: {score}/20 | Result: Not Premium")
                     continue
 
-                if len(data_ltf) < 2:
+                # =========================
+                # 🔥 SCORE FILTER
+                # =========================
+                if score < TRADE_SCORE_THRESHOLD:
+                    log(f"[SCAN] {symbol} | Score: {score}/20 | Result: Below Threshold")
                     continue
 
-                # ==================================================
-                # 🔥 SCORING SYSTEM (VERBOSE)
-                # ==================================================
-                total_score = 0
-
-                # --- CONTEXT (2 poin)
-                context = build_context(data_htf, data_ltf)
-                htf_bias = context.get("htf_trend", "UNCLEAR")
-
-                context_score = 2 if htf_bias != "UNCLEAR" else 0
-                total_score += context_score
-
-                # --- LIQUIDITY (3 poin)
-                liquidity = analyze_liquidity(data_ltf)
-                liquidity_score = 3 if liquidity.get("liquidity_detected", False) else 0
-                total_score += liquidity_score
-
-                # --- ZONE (3 poin)
-                zone = analyze_zone(data_ltf)
-                zone_score = 3 if zone and zone.get("zone_valid", False) else 0
-                total_score += zone_score
-
-                # ==================================================
-                # 🔥 VERBOSE LOGGING (TRANSPARANSI)
-                # ==================================================
-                log(f"📊 {SYMBOL} | Score: {total_score}/8 "
-                    f"(Context: {context_score}, Liquidity: {liquidity_score}, Zone: {zone_score})")
-
-                # ==================================================
-                # 🔥 STRICT FILTER
-                # ==================================================
-                if total_score < TRADE_SCORE_THRESHOLD:
-                    log(f"❌ {SYMBOL} REJECTED (Score below threshold)")
-                    continue
-                else:
-                    log(f"✅ {SYMBOL} PASSED SCORING")
-
-                # ==================================================
-                # 🔰 VALIDASI LANJUT
-                # ==================================================
-                last_c = data_ltf.iloc[-2]
-
-                range_candle = last_c.high - last_c.low
-                body_ratio = abs(last_c.close - last_c.open) / range_candle if range_candle > 0 else 0
-
-                if body_ratio < 0.7:
+                # =========================
+                # 🔥 RISK CHECK
+                # =========================
+                if not allowed:
+                    log(f"[SCAN] {symbol} | Score: {score}/20 | Result: {reason}")
                     continue
 
-                if t.time() - last_trade_times.get(SYMBOL, 0) < COOLDOWN_SECONDS:
+                # =========================
+                # 🔥 ENTRY LOGIC
+                # =========================
+                price = ltf.iloc[-1]['close']
+                atr = calculate_atr(ltf)
+
+                if atr is None:
                     continue
 
-                tick = mt5.symbol_info_tick(SYMBOL)
-                if not tick or tick.ask == 0 or tick.bid == 0:
-                    continue
+                is_buy = trend == "BULLISH"
 
-                # ==================================================
-                # 🔰 ENTRY LOGIC
-                # ==================================================
-                buy_signal = (htf_bias == "BULLISH")
-                entry = tick.ask if buy_signal else tick.bid
+                sl = get_swing_sl(ltf, is_buy, atr)
+                tp = calculate_tp(price, sl)
 
-                if buy_signal:
-                    raw_sl = entry - (150 * symbol_info.point)
-                    tp = entry + (200 * symbol_info.point)
-                else:
-                    raw_sl = entry + (150 * symbol_info.point)
-                    tp = entry - (200 * symbol_info.point)
+                # =========================
+                # 🚀 EXECUTE
+                # =========================
+                log(f"[ENTRY] {symbol} | Score: {score} | EXECUTE")
 
-                sl = adjust_to_stops_level(SYMBOL, entry, raw_sl, buy_signal)
-
-                # ==================================================
-                # 🔰 LOT SIZE
-                # ==================================================
-                lot = get_lot_size(risk_engine, entry, sl)
-
-                if not lot or lot < LOT_MIN:
-                    continue
-
-                # ==================================================
-                # 🔥 EXECUTION
-                # ==================================================
-                result = execute_trade_hybrid(
-                    symbol=SYMBOL,
-                    buy_signal=buy_signal,
-                    sl=sl,
-                    tp=tp,
-                    lot=lot
+                exec_engine.execute_trade(
+                    symbol,
+                    mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
+                    0.01,
+                    100,  # tetap dipakai engine internal
+                    200
                 )
 
-                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    last_trade_times[SYMBOL] = t.time()
-                    save_cooldown_state(last_trade_times)
-
-                    log(f"🔥 TRADE EXECUTED: {SYMBOL} | Lot {lot} | Score {total_score}")
-
-            # ==================================================
-            # 🔥 THROTTLING SCAN (MANDATORY UPDATE)
-            # ==================================================
-            """
-            ======================================================
-            🔥 PERUBAHAN PENTING:
-            - Sebelumnya: scan tiap 10 detik
-            - Sekarang: scan tiap 60 detik
-
-            TUJUAN:
-            - Lebih stabil
-            - Tidak over-scan
-            - Lebih profesional untuk live trading
-            ======================================================
-            """
             t.sleep(60)
 
         except Exception as e:
-            log(f"⚠️ ERROR: {e}")
+            log(f"❌ ERROR: {e}")
             t.sleep(5)
 
 
-# ==========================================================
-# 🔰 ENTRY POINT
-# ==========================================================
 if __name__ == "__main__":
     main()
